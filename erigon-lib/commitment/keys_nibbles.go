@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/erigontech/erigon-lib/common/length"
-	ecrypto "github.com/erigontech/erigon-lib/crypto"
 )
 
 // KeyToHexNibbleHash hashes plain key with respect to plain key size (part < 20 bytes for account, part >= 20 bytes for storage)
@@ -19,12 +18,12 @@ func KeyToHexNibbleHash(key []byte) []byte {
 	if len(key) > length.Addr { // storage
 		nibblized = make([]byte, 128)
 		hashed = nibblized[64:]
-		copy(hashed[:32], ecrypto.Keccak256(key[:length.Addr]))
-		copy(hashed[32:], ecrypto.Keccak256(key[length.Addr:]))
+		copy(hashed[:32], GetKey(key[:length.Addr]))
+		copy(hashed[32:], GetKey(key[length.Addr:]))
 	} else {
 		nibblized = make([]byte, 64)
 		hashed = nibblized[32:]
-		copy(hashed, ecrypto.Keccak256(key))
+		copy(hashed, GetKey(key))
 	}
 
 	for i, b := range hashed {

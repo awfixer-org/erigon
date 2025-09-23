@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -454,8 +455,9 @@ func ExecV3(ctx context.Context,
 	blockLimit := uint64(cfg.syncCfg.LoopBlockLimit)
 	var errExhausted *ErrLoopExhausted
 
+	const FINAL_BLOCK = math.MaxUint64
 Loop:
-	for ; blockNum <= maxBlockNum; blockNum++ {
+	for ; blockNum <= maxBlockNum && blockNum <= FINAL_BLOCK; blockNum++ {
 		// set shouldGenerateChangesets=true if we are at last n blocks from maxBlockNum. this is as a safety net in chains
 		// where during initial sync we can expect bogus blocks to be imported.
 		if !shouldGenerateChangesets && shouldGenerateChangesetsForLastBlocks && blockNum > cfg.blockReader.FrozenBlocks() && blockNum+changesetSafeRange >= maxBlockNum {

@@ -26,15 +26,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/google/btree"
+	lru "github.com/hashicorp/golang-lru/arc/v2"
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/common/length"
 	"github.com/erigontech/erigon-lib/crypto"
+	ecrypto "github.com/erigontech/erigon-lib/crypto"
 	"github.com/erigontech/erigon-lib/etl"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
@@ -943,6 +946,42 @@ type Updates struct {
 
 	sortPerNibble bool // if true, use nibbles collectors instead of etl (all-in-one)
 	nibbles       [16]*etl.Collector
+
+	// keyCache    *lru.ARCCache[string, []byte]
+	// cMiss, cHit uint64
+	// ticker      *time.Ticker
+}
+
+var keyCache *lru.ARCCache[string, []byte]
+var cMiss, cHit uint64
+var ticker *time.Ticker
+
+func init() {
+	var err error
+	keyCache, err = lru.NewARC[string, []byte](10_000_000)
+	if err != nil {
+		panic(err)
+	}
+	ticker = time.NewTicker(30 * time.Second)
+}
+
+func GetKey(key []byte) []byte {
+	select {
+	case <-ticker.C:
+		log.Warn("key cache", "hit", cHit, "miss", cMiss, "len", keyCache.Len())
+	default:
+	}
+
+	c, ok := keyCache.Get(string(key))
+	if ok {
+		cHit++
+		return c
+	}
+
+	hash := ecrypto.Keccak256(key)
+	keyCache.Add(string(key), hash)
+	cMiss++
+	return hash
 }
 
 // Should be called right after updates initialisation. Otherwise could lost some data
@@ -966,6 +1005,18 @@ func NewUpdates(m Mode, tmpdir string, hasher keyHasher) *Updates {
 		tmpdir: tmpdir,
 		mode:   m,
 	}
+	log.Warn("NEW UPDATES")
+	// var err error
+	// t.keyCache, err = lru.NewARC[string, []byte](10_000_000)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// t.ticker = time.NewTicker(30 * time.Second)
+	// go func() {
+	// 	for range t.ticker.C {
+	// 		log.Warn("key cache", "hit", t.cHit, "miss", t.cMiss)
+	// 	}
+	// }()
 	if t.mode == ModeDirect {
 		t.keys = make(map[string]struct{})
 		t.initCollector()
@@ -1119,6 +1170,8 @@ func (t *Updates) TouchCode(c *KeyUpdate, code []byte) {
 }
 
 func (t *Updates) Close() {
+	log.Warn("STOP UPDATES")
+	// t.ticker.Stop()
 	if t.keys != nil {
 		clear(t.keys)
 	}
