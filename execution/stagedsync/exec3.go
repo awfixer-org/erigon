@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"math"
 	"runtime"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -339,7 +338,7 @@ func ExecV3(ctx context.Context,
 
 	logger.Warn("ExecV3-3")
 	if maxTxNum == 0 {
-		debug.PrintStack()
+		// debug.PrintStack()
 		return nil
 	}
 	logger.Warn("ExecV3-3.1")
@@ -870,7 +869,7 @@ Loop:
 	}
 
 	logger.Warn("ExecV3-100")
-	debug.PrintStack()
+	// debug.PrintStack()
 	return nil
 }
 
