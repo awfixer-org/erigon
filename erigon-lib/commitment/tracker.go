@@ -9,6 +9,7 @@ import (
 type StopWatch struct {
 	blockNum   uint64
 	start      time.Time
+	c          uint64
 	cumulative time.Duration
 	logger     log.Logger
 }
@@ -26,6 +27,7 @@ func (s *StopWatch) StartBlock(blockNum uint64) {
 		panic("stop watch already started")
 	}
 	s.blockNum = blockNum
+	s.c = 0
 	s.cumulative = 0
 	s.logger.Info("start block", "block", s.blockNum)
 }
@@ -35,7 +37,7 @@ func (s *StopWatch) EndBlock() {
 		panic("stop watch already started")
 	}
 
-	s.logger.Warn("stop block", "block", s.blockNum, "in", s.cumulative.Milliseconds())
+	s.logger.Warn("stop block", "block", s.blockNum, "in", s.cumulative.Milliseconds(), "c", s.c)
 }
 
 func (s *StopWatch) Start() {
@@ -52,6 +54,7 @@ func (s *StopWatch) Stop() {
 	}
 
 	dur := time.Since(s.start)
+	s.c++
 	s.cumulative += dur
 	// s.logger.Info("stop stop watch", "block", s.blockNum)
 	s.start = time.Unix(0, 0)
