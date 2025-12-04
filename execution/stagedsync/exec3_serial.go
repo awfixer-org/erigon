@@ -36,6 +36,9 @@ func (se *serialExecutor) status(ctx context.Context, commitThreshold uint64) er
 }
 
 func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp *core.GasPool) (cont bool, err error) {
+	if tasks[0].BlockNum == 217037890 {
+		fmt.Printf("here")
+	}
 	for _, txTask := range tasks {
 		if txTask.Error != nil {
 			return false, nil
@@ -93,11 +96,11 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 				return false, err
 			}
 			se.logger.Warn(fmt.Sprintf("[%s] Execution failed", se.execStage.LogPrefix()),
-				"block", txTask.BlockNum, "txNum", txTask.TxNum, "header-hash", txTask.Header.Hash().String(), "err", err, "inMem", se.inMemExec)
+				"block", txTask.BlockNum, "txNum", txTask.TxNum, "header-hash", txTask.Header.Hash().String(), "err", err, "inMem", se.inMemExec, "arbosv", txTask.Rules.ArbOSVersion)
+			os.Exit(0)
 			if se.cfg.hd != nil && se.cfg.hd.POSSync() && errors.Is(err, consensus.ErrInvalidBlock) {
 				se.cfg.hd.ReportBadHeaderPoS(txTask.Header.Hash(), txTask.Header.ParentHash)
 			}
-			os.Exit(1)
 			if se.cfg.badBlockHalt {
 				return false, err
 			}

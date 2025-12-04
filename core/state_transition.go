@@ -650,18 +650,18 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (result *
 	// state divergence.
 	usedMultiGas, vmerr = st.handleRevertedTx(msg.(*types.Message), usedMultiGas)
 
-	b := st.gasRemaining
+	// b := st.gasRemaining
 	if contractCreation {
 		// The reason why we don't increment nonce here is that we need the original
 		// nonce to calculate the address of the contract that is being created
 		// It does get incremented inside the `Create` call, after the computation
 		// of the contract's address, but before the execution of the code.
 		ret, *deployedContract, st.gasRemaining, multiGas, vmerr = st.evm.Create(sender, st.data, st.gasRemaining, st.value, bailout)
-		fmt.Printf("deployed contract: %x cost %d\n", deployedContract, b-st.gasRemaining)
+		// fmt.Printf("deployed contract: %x cost %d\n", deployedContract, b-st.gasRemaining)
 		usedMultiGas = usedMultiGas.SaturatingAdd(multiGas)
 	} else {
 		ret, st.gasRemaining, multiGas, vmerr = st.evm.Call(sender, st.to(), st.data, st.gasRemaining, st.value, bailout)
-		fmt.Printf("call contract: %x cost %d\n", st.to(), b-st.gasRemaining)
+		// fmt.Printf("call contract: %x cost %d\n", st.to(), b-st.gasRemaining)
 		usedMultiGas = usedMultiGas.SaturatingAdd(multiGas)
 	}
 
@@ -675,12 +675,11 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (result *
 		}
 
 		// Refund the gas that was held to limit the amount of computation done.
-		st.gasRemaining += st.calcHeldGasRefund() // affects .gasUsed()
+		// st.gasRemaining += st.calcHeldGasRefund() // affects .gasUsed()
 
 		if st.evm.ProcessingHook.IsArbitrum() {
 			frg := st.evm.ProcessingHook.ForceRefundGas()
-			fmt.Printf("b %d gas used %d force refund gas: %d, remains %d\n",
-				st.evm.Context.BlockNumber, st.gasUsed(), frg, st.gasRemaining)
+			// fmt.Printf("b %d gas used %d force refund gas: %d, remains %d\n",st.evm.Context.BlockNumber, st.gasUsed(), frg, st.gasRemaining)
 			st.gasRemaining += frg
 			nonrefundable := st.evm.ProcessingHook.NonrefundableGas()
 			var refund uint64
@@ -789,7 +788,7 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (result *
 			tracer.CaptureArbitrumTransfer(nil, &tipReceipient, tracingTipAmount, false, "tip")
 		}
 	}
-	fmt.Printf("tx from %x used gas: %d, initGas %d remain %d %s\n", st.msg.From(), st.gasUsed(), st.initialGas, st.gasRemaining, usedMultiGas)
+	// fmt.Printf("tx from %x used gas: %d, initGas %d remain %d %s\n", st.msg.From(), st.gasUsed(), st.initialGas, st.gasRemaining, usedMultiGas)
 
 	st.evm.ProcessingHook.EndTxHook(st.gasRemaining, vmerr == nil)
 
