@@ -1,10 +1,12 @@
 package app
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -13,7 +15,6 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/erigontech/erigon/cmd/utils"
-	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv"
@@ -38,6 +39,12 @@ var (
 		Value:    false,
 		Aliases:  []string{"n"},
 		Category: "Reset",
+	}
+	preverifiedFlag = cli.StringFlag{
+		Name:     "preverified",
+		Category: "Reset",
+		Usage:    "preverified to use (remote, local, embedded)",
+		Value:    "remote",
 	}
 )
 
@@ -91,38 +98,65 @@ func resetCliAction(cliCtx *cli.Context) (err error) {
 		return fmt.Errorf("failed to lock data dir %v: %w", dirs.DataDir, err)
 	}
 	defer unlock()
-	err = snapcfg.LoadRemotePreverified(cliCtx.Context)
-	if err != nil {
-		// TODO: Check if we should continue? What if we ask for a git revision and
-		// can't get it? What about a branch? Can we reset to the embedded snapshot hashes?
-		return fmt.Errorf("loading remote preverified snapshots: %w", err)
+
+	switch value := preverifiedFlag.Get(cliCtx); value {
+	case "local":
+		os.Setenv(snapcfg.RemotePreverifiedEnvKey, dirs.PreverifiedPath())
+		fallthrough
+	case "remote":
+		err = snapcfg.LoadRemotePreverified(cliCtx.Context)
+		if err != nil {
+			// TODO: Check if we should continue? What if we ask for a git revision and
+			// can't get it? What about a branch? Can we reset to the embedded snapshot hashes?
+			return fmt.Errorf("loading remote preverified snapshots: %w", err)
+		}
+	case "embedded":
+		// Should already be loaded.
+	default:
+		err = fmt.Errorf("invalid preverified flag value %q", value)
+		return
 	}
+
 	cfg, known := snapcfg.KnownCfg(chainName)
 	if !known {
 		// Wtf does this even mean?
 		return fmt.Errorf("config for chain %v is not known", chainName)
 	}
-	// Should we check cfg.Local? We could be resetting to the preverified.toml...?
+	// Should we check cfg.Local? We could be resetting to the preverifiedFlag.toml...?
 	logger.Info(
 		"Loaded preverified snapshots hashes",
 		"len", len(cfg.Preverified.Items),
 		"chain", chainName,
 	)
-	removeFunc := func(path string) error {
-		logger.Debug("Removing snapshot dir file", "path", path)
-		return dir.RemoveFile(filepath.Join(dirs.Snap, path))
-	}
+
 	if dryRun {
-		removeFunc = dryRunRemove
+		log.Warn("Resetting datadir in dry run mode. Files that would be removed will be printed to stdout.")
 	}
+
 	reset := reset{
-		removeUnknown: removeLocal,
-		logger:        logger,
+		fs:                   os.DirFS(dirs.DataDir),
+		removeUnknown:        removeLocal,
+		logger:               logger,
+		preverifiedSnapshots: cfg.Preverified.Items,
+		removeFunc: func(path string) error {
+			osName := filepath.Join(dirs.DataDir, path)
+			if dryRun {
+				println(osName)
+				return nil
+			}
+			logger.Debug("Removing datadir file", "name", osName)
+			return os.Remove(osName)
+		},
 	}
-	logger.Info("Resetting snapshots directory", "path", dirs.Snap)
-	err = reset.walkSnapshots(dirs.Snap, cfg.Preverified.Items, removeFunc)
+	return reset.run()
+}
+
+func (reset *reset) run() (err error) {
+	logger := reset.logger
+	logger.Info("Resetting snapshots directory", "path", reset.pathForLog(datadir.SnapDir))
+	err = reset.walkSnapshots()
 	if err != nil {
-		err = fmt.Errorf("walking snapshots: %w", err)
+		err = fmt.Errorf("resetting snapshots: %w", err)
 		return
 	}
 	logger.Info("Files NOT removed from snapshots directory",
@@ -132,27 +166,26 @@ func resetCliAction(cliCtx *cli.Context) (err error) {
 		"torrents", reset.stats.removed.torrentFiles,
 		"data", reset.stats.removed.dataFiles)
 	// Remove chaindata last, so that the config is available if there's an error.
-	if removeLocal {
+	if reset.removeLocal {
 		for _, extraDir := range []string{
 			dbcfg.HeimdallDB,
 			dbcfg.PolygonBridgeDB,
 		} {
-			extraFullPath := filepath.Join(dirs.DataDir, extraDir)
-			err = dir.RemoveAll(extraFullPath)
+			// Probably shouldn't log these unless they existed, it would confuse the user for
+			// unrelated chains.
+			err = reset.removeAll(path.Join(reset.datadirPath, extraDir))
 			if err != nil {
 				return fmt.Errorf("removing extra dir %q: %w", extraDir, err)
 			}
 		}
-		logger.Info("Removing chaindata dir", "path", dirs.Chaindata)
-		if !dryRun {
-			err = dir.RemoveAll(dirs.Chaindata)
-		}
+		logger.Info("Removing chaindata dir", "path", reset.pathForLog(dbcfg.ChainDB))
+		err = reset.removeAll(path.Join(reset.datadirPath, dbcfg.ChainDB))
 		if err != nil {
 			err = fmt.Errorf("removing chaindata dir: %w", err)
 			return
 		}
 	}
-	err = removeFunc(datadir.PreverifiedFileName)
+	err = reset.removeFunc(datadir.PreverifiedFileName)
 	if err == nil {
 		logger.Info("Removed snapshots lock file", "path", datadir.PreverifiedFileName)
 	} else {
@@ -163,6 +196,103 @@ func resetCliAction(cliCtx *cli.Context) (err error) {
 	}
 	logger.Info("Reset complete. Start Erigon as usual, missing files will be downloaded.")
 	return nil
+}
+
+type removeAll struct {
+	remove func(name string, info fs.FileInfo) error
+	links  int
+}
+
+func (me removeAll) incLinks() removeAll {
+	me.links++
+	return me
+}
+
+// Maybe we should return a "preserve" here?
+func (reset *reset) removeAllInner(name string, fi fs.FileInfo, removeAll removeAll) error {
+	reset.logger.Debug("reset.removeAllInner", "name", name)
+	if removeAll.links > reset.linkLimit {
+		return fmt.Errorf("symlink depth exceeded %v", reset.linkLimit)
+	}
+	switch modeType := fi.Mode().Type(); modeType {
+	case fs.ModeDir:
+		entries, err := fs.ReadDir(reset.fs, name)
+		if err != nil {
+			return err
+		}
+		for _, de := range entries {
+			info, err := de.Info()
+			if err != nil {
+				return err
+			}
+			fullName := path.Join(name, de.Name())
+			err = reset.removeAllInner(fullName, info, removeAll)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	case 0:
+		return removeAll.remove(name, fi)
+	case fs.ModeSymlink:
+		targetInfo, err := fs.Stat(reset.fs, name)
+		if err != nil {
+			//if errors.Is(err, fs.ErrNotExist) {
+			//	reset.logger.Warn("dangling symlink", "name", name, "err", err)
+			//	err = nil
+			//}
+			//return err
+			return fmt.Errorf("stat symlink: %w", err)
+		}
+		// Will this handle Windows' weird mount points etc.?
+		if !targetInfo.Mode().IsDir() {
+			// Can defer special-file type handling to given remove function.
+			return removeAll.remove(name, targetInfo)
+		}
+		// TODO: Try recursion here without link. Should be caught by OS now.
+		err = reset.removeAllInner(name, targetInfo, removeAll.incLinks())
+		if err != nil {
+			return fmt.Errorf("removing symlink target: %w", err)
+		}
+		return nil
+	default:
+		reset.logger.Warn("ignoring unhandled file mode type", "mode type", modeType.String())
+		return nil
+	}
+}
+
+func (reset *reset) removeAll(name string) error {
+	return reset.removeAllFilter(name, func(name string, info fs.FileInfo) error {
+		return reset.removeFunc(name)
+	})
+}
+
+func (reset *reset) removeAllFilter(name string, remove func(name string, info fs.FileInfo) error) error {
+	reset.logger.Debug("reset.removeAll", "name", name)
+	fi, err := fs.Lstat(reset.fs, name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			err = nil
+		}
+		return err
+	}
+	err = reset.removeAllInner(name, fi, removeAll{
+		remove: remove,
+		links:  0,
+	})
+	if err != nil {
+		return err
+	}
+	// Not a regular file or directory
+	if fi.Mode().Type()&(^fs.ModeDir) == 0 {
+		return reset.removeFunc(name)
+	}
+	return nil
+}
+
+// Probably want to render full/real path rather than rooted inside fs.
+func (reset *reset) pathForLog(path string) string {
+	return path
 }
 
 func getChainNameFromChainData(cliCtx *cli.Context, logger log.Logger, chainDataDir string) (_ g.Option[string], err error) {
@@ -204,10 +334,6 @@ func getChainNameFromChainData(cliCtx *cli.Context, logger log.Logger, chainData
 	return g.Some(chainCfg.ChainName), nil
 }
 
-func dryRunRemove(path string) error {
-	return nil
-}
-
 type resetStats struct {
 	torrentFiles int
 	dataFiles    int
@@ -215,9 +341,18 @@ type resetStats struct {
 }
 
 type reset struct {
-	logger        log.Logger
-	removeUnknown bool
-	stats         struct {
+	logger log.Logger
+	// path is the relative path to the walk root. Called for each file that should be removed.
+	// Error is passed back to the walk function.
+	removeFunc           func(path string) error
+	fs                   fs.FS
+	datadirPath          string
+	preverifiedSnapshots snapcfg.PreverifiedItems
+	removeUnknown        bool
+	removeLocal          bool
+	linkLimit            int
+
+	stats struct {
 		removed  resetStats
 		retained resetStats
 	}
@@ -225,24 +360,46 @@ type reset struct {
 
 type resetItemInfo struct {
 	path          string
-	realFilePath  func() string
 	hash          g.Option[string]
 	isTorrent     bool
 	inPreverified bool
 }
 
-// Walks the given snapshots directory, removing files that are not in the preverified set.
-func (me *reset) walkSnapshots(
-	// Could almost pass fs.FS here except metainfo.LoadFromFile expects a string filepath.
-	snapDir string,
-	preverified snapcfg.PreverifiedItems,
-	// path is the relative path to the walk root. Called for each file that should be removed.
-	// Error is passed back to the walk function.
-	remove func(path string) error,
-) error {
+// Walks the given snapshots directory, removing files that are not in the preverifiedFlag set.
+func (me *reset) walkSnapshots() (err error) {
+	return me.removeAllFilter(
+		path.Join(me.datadirPath, datadir.SnapDir),
+		func(name string, info fs.FileInfo) error {
+			path := name
+			itemName, _ := strings.CutSuffix(path, ".part")
+			itemName, isTorrent := strings.CutSuffix(itemName, ".torrent")
+			item, ok := me.preverifiedSnapshots.Get(itemName)
+			doRemove := me.decideRemove(resetItemInfo{
+				path:          path,
+				hash:          func() g.Option[string] { return g.OptionFromTuple(item.Hash, ok) }(),
+				isTorrent:     isTorrent,
+				inPreverified: ok,
+			})
+			stats := &me.stats.retained
+			if doRemove {
+				stats = &me.stats.removed
+				err = me.removeFunc(path)
+				if err != nil {
+					return fmt.Errorf("removing file %v: %w", path, err)
+				}
+			}
+			if isTorrent {
+				stats.torrentFiles++
+			} else {
+				stats.dataFiles++
+			}
+			return nil
+		},
+	)
+
 	return fs.WalkDir(
-		os.DirFS(snapDir),
-		".",
+		me.fs,
+		path.Join(me.datadirPath, datadir.SnapDir),
 		func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				// Our job is to remove anything that shouldn't be here... so if we can't read a dir
@@ -255,14 +412,11 @@ func (me *reset) walkSnapshots(
 			if path == datadir.PreverifiedFileName {
 				return nil
 			}
-			// Shouldn't be necessary with fs package.
-			slashPath := filepath.ToSlash(path)
-			itemName, _ := strings.CutSuffix(slashPath, ".part")
+			itemName, _ := strings.CutSuffix(path, ".part")
 			itemName, isTorrent := strings.CutSuffix(itemName, ".torrent")
-			item, ok := preverified.Get(itemName)
+			item, ok := me.preverifiedSnapshots.Get(itemName)
 			doRemove := me.decideRemove(resetItemInfo{
 				path:          path,
-				realFilePath:  func() string { return filepath.Join(snapDir, path) },
 				hash:          func() g.Option[string] { return g.OptionFromTuple(item.Hash, ok) }(),
 				isTorrent:     isTorrent,
 				inPreverified: ok,
@@ -270,7 +424,7 @@ func (me *reset) walkSnapshots(
 			stats := &me.stats.retained
 			if doRemove {
 				stats = &me.stats.removed
-				err = remove(path)
+				err = me.removeFunc(path)
 				if err != nil {
 					return fmt.Errorf("removing file %v: %w", path, err)
 				}
@@ -288,31 +442,45 @@ func (me *reset) walkSnapshots(
 // Decides whether to remove a file, and logs the reasoning.
 func (me *reset) decideRemove(file resetItemInfo) bool {
 	logger := me.logger
-	path := file.path
+	name := file.path
 	if !file.inPreverified {
-		logger.Debug("file NOT in preverified list", "path", path)
+		if !me.removeUnknown {
+			logger.Debug("skipping unknown file", "name", name)
+		}
 		return me.removeUnknown
 	}
+	// TODO: missing or incorrect torrent delete data file?
 	if file.isTorrent {
-		mi, err := metainfo.LoadFromFile(file.realFilePath())
+		mi, err := me.loadMetainfoFromFile(file.path)
 		if err != nil {
-			logger.Error("error loading metainfo file", "path", path, "err", err)
+			logger.Error("error loading metainfo file", "name", name, "err", err)
 			return true
 		}
 		expectedHash := file.hash.Unwrap()
 		if mi.HashInfoBytes().String() == expectedHash {
-			logger.Debug("torrent file matches preverified hash", "path", path)
+			logger.Debug("torrent file matches preverified hash", "name", name)
 			return false
 		} else {
-			logger.Debug("torrent file infohash does NOT match preverified",
-				"path", path,
+			logger.Debug("removing metainfo file with incorrect infohash",
+				"name", name,
 				"expected", expectedHash,
 				"actual", mi.HashInfoBytes())
 			return true
 		}
 	} else {
 		// No checks required. Downloader will clobber it into shape after reset on next run.
-		logger.Debug("data file is in preverified", "path", path)
+		logger.Debug("skipping expected snapshot", "name", name)
 		return false
 	}
+}
+
+func (me *reset) loadMetainfoFromFile(path string) (mi *metainfo.MetaInfo, err error) {
+	f, err := me.fs.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	var buf bufio.Reader
+	buf.Reset(f)
+	return metainfo.Load(&buf)
 }
