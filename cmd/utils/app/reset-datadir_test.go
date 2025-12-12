@@ -85,19 +85,22 @@ func TestResetEscapeRootAbsoluteSymlink(t *testing.T) {
 	})
 }
 func TestResetCheapDiskExample(t *testing.T) {
-	startEntries := []fsEntry{
-		{Name: "bystander"},
-		{Name: "datadir/chaindata", Mode: fs.ModeSymlink, Data: "../fastdisk"},
-		{Name: "fastdisk", Mode: fs.ModeDir},
-		{Name: "datadir/snapshots", Mode: fs.ModeDir},
-		{Name: "datadir/snapshots/domain", Mode: fs.ModeSymlink, Data: ""},
-		{Name: "datadir/snapshots/history", Mode: fs.ModeDir},
-		{Name: "datadir/heimdall/mystuff"},
-	}
-	endEntries := append(
-		slices.Clone(startEntries[:5]),
-		fsEntry{Name: ".", Mode: fs.ModeDir})
 	withOsRoot(t, func(osRoot *os.Root) {
+		absFastDiskLink, err := filepath.Abs(filepath.Join(osRoot.Name(), "fastdisk"))
+		qt.Assert(t, qt.IsNil(err))
+		t.Log("absolute fastdisk path:", absFastDiskLink)
+		startEntries := []fsEntry{
+			{Name: "bystander"},
+			{Name: "datadir/chaindata", Mode: fs.ModeSymlink, Data: "../fastdisk"},
+			{Name: "fastdisk", Mode: fs.ModeDir},
+			{Name: "datadir/snapshots", Mode: fs.ModeDir},
+			{Name: "datadir/snapshots/domain", Mode: fs.ModeSymlink, Data: absFastDiskLink},
+			{Name: "datadir/snapshots/history", Mode: fs.ModeDir},
+			{Name: "datadir/heimdall/mystuff"},
+		}
+		endEntries := append(
+			slices.Clone(startEntries[:5]),
+			fsEntry{Name: ".", Mode: fs.ModeDir})
 		makeEntries(t, startEntries, osRoot)
 		rootFS := osRoot.FS()
 		printFs(t, rootFS)

@@ -154,7 +154,7 @@ func resetCliAction(cliCtx *cli.Context) (err error) {
 func (reset *reset) run() (err error) {
 	logger := reset.logger
 	logger.Info("Resetting snapshots directory", "path", reset.pathForLog(datadir.SnapDir))
-	err = reset.walkSnapshots()
+	err = reset.doSnapshots()
 	if err != nil {
 		err = fmt.Errorf("resetting snapshots: %w", err)
 		return
@@ -199,24 +199,19 @@ func (reset *reset) run() (err error) {
 }
 
 type removeAll struct {
+	logger log.Logger
+	fs     fs.FS
 	remove func(name string, info fs.FileInfo) error
-	links  int
 }
 
-func (me removeAll) incLinks() removeAll {
-	me.links++
-	return me
-}
-
-// Maybe we should return a "preserve" here?
-func (reset *reset) removeAllInner(name string, fi fs.FileInfo, removeAll removeAll) error {
-	reset.logger.Debug("reset.removeAllInner", "name", name)
-	if removeAll.links > reset.linkLimit {
-		return fmt.Errorf("symlink depth exceeded %v", reset.linkLimit)
-	}
+// The recursive remove call. We remove the contents of directories, and symlinks to
+// *non-directories*. Non-directory symlink targets will be cleaned up as appropriate if the target
+// is found. We also remove anything else. Note that remove means calling the remove field, which
+// makes the real decisions.
+func (me removeAll) inner(name string, fi fs.FileInfo) error {
 	switch modeType := fi.Mode().Type(); modeType {
 	case fs.ModeDir:
-		entries, err := fs.ReadDir(reset.fs, name)
+		entries, err := fs.ReadDir(me.fs, name)
 		if err != nil {
 			return err
 		}
@@ -226,68 +221,50 @@ func (reset *reset) removeAllInner(name string, fi fs.FileInfo, removeAll remove
 				return err
 			}
 			fullName := path.Join(name, de.Name())
-			err = reset.removeAllInner(fullName, info, removeAll)
+			err = me.inner(fullName, info)
 			if err != nil {
 				return err
 			}
 		}
 		return nil
-	case 0:
-		return removeAll.remove(name, fi)
 	case fs.ModeSymlink:
-		targetInfo, err := fs.Stat(reset.fs, name)
+		targetInfo, err := fs.Stat(me.fs, name)
 		if err != nil {
-			//if errors.Is(err, fs.ErrNotExist) {
-			//	reset.logger.Warn("dangling symlink", "name", name, "err", err)
-			//	err = nil
-			//}
-			//return err
-			return fmt.Errorf("stat symlink: %w", err)
+			return fmt.Errorf("statting symlink target: %w", err)
 		}
-		// Will this handle Windows' weird mount points etc.?
-		if !targetInfo.Mode().IsDir() {
-			// Can defer special-file type handling to given remove function.
-			return removeAll.remove(name, targetInfo)
+		if targetInfo.IsDir() {
+			// Remove the contents only
+			return me.inner(name, targetInfo)
+		} else {
+			// Remove the link itself
+			return me.remove(name, fi)
 		}
-		// TODO: Try recursion here without link. Should be caught by OS now.
-		err = reset.removeAllInner(name, targetInfo, removeAll.incLinks())
-		if err != nil {
-			return fmt.Errorf("removing symlink target: %w", err)
-		}
-		return nil
 	default:
-		reset.logger.Warn("ignoring unhandled file mode type", "mode type", modeType.String())
-		return nil
+		return me.remove(name, fi)
 	}
+}
+
+func (me removeAll) do(name string) error {
+	info, err := fs.Stat(me.fs, name)
+	if err != nil {
+		return err
+	}
+	return me.inner(name, info)
 }
 
 func (reset *reset) removeAll(name string) error {
-	return reset.removeAllFilter(name, func(name string, info fs.FileInfo) error {
+	return reset.removeAllFancy(name, func(name string, info fs.FileInfo) error {
 		return reset.removeFunc(name)
 	})
 }
 
-func (reset *reset) removeAllFilter(name string, remove func(name string, info fs.FileInfo) error) error {
-	reset.logger.Debug("reset.removeAll", "name", name)
-	fi, err := fs.Lstat(reset.fs, name)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			err = nil
-		}
-		return err
-	}
-	err = reset.removeAllInner(name, fi, removeAll{
+func (reset *reset) removeAllFancy(name string, remove func(name string, info fs.FileInfo) error) error {
+	ra := removeAll{
+		logger: reset.logger,
+		fs:     reset.fs,
 		remove: remove,
-		links:  0,
-	})
-	if err != nil {
-		return err
 	}
-	// Not a regular file or directory
-	if fi.Mode().Type()&(^fs.ModeDir) == 0 {
-		return reset.removeFunc(name)
-	}
-	return nil
+	return ra.do(name)
 }
 
 // Probably want to render full/real path rather than rooted inside fs.
@@ -365,17 +342,15 @@ type resetItemInfo struct {
 	inPreverified bool
 }
 
-// Walks the given snapshots directory, removing files that are not in the preverifiedFlag set.
-func (me *reset) walkSnapshots() (err error) {
-	return me.removeAllFilter(
+func (me *reset) doSnapshots() (err error) {
+	return me.removeAllFancy(
 		path.Join(me.datadirPath, datadir.SnapDir),
 		func(name string, info fs.FileInfo) error {
-			path := name
-			itemName, _ := strings.CutSuffix(path, ".part")
+			itemName, _ := strings.CutSuffix(name, ".part")
 			itemName, isTorrent := strings.CutSuffix(itemName, ".torrent")
 			item, ok := me.preverifiedSnapshots.Get(itemName)
 			doRemove := me.decideRemove(resetItemInfo{
-				path:          path,
+				path:          name,
 				hash:          func() g.Option[string] { return g.OptionFromTuple(item.Hash, ok) }(),
 				isTorrent:     isTorrent,
 				inPreverified: ok,
@@ -383,50 +358,9 @@ func (me *reset) walkSnapshots() (err error) {
 			stats := &me.stats.retained
 			if doRemove {
 				stats = &me.stats.removed
-				err = me.removeFunc(path)
+				err = me.removeFunc(name)
 				if err != nil {
-					return fmt.Errorf("removing file %v: %w", path, err)
-				}
-			}
-			if isTorrent {
-				stats.torrentFiles++
-			} else {
-				stats.dataFiles++
-			}
-			return nil
-		},
-	)
-
-	return fs.WalkDir(
-		me.fs,
-		path.Join(me.datadirPath, datadir.SnapDir),
-		func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				// Our job is to remove anything that shouldn't be here... so if we can't read a dir
-				// we are in trouble.
-				return fmt.Errorf("error walking path %v: %w", path, err)
-			}
-			if d.IsDir() {
-				return nil
-			}
-			if path == datadir.PreverifiedFileName {
-				return nil
-			}
-			itemName, _ := strings.CutSuffix(path, ".part")
-			itemName, isTorrent := strings.CutSuffix(itemName, ".torrent")
-			item, ok := me.preverifiedSnapshots.Get(itemName)
-			doRemove := me.decideRemove(resetItemInfo{
-				path:          path,
-				hash:          func() g.Option[string] { return g.OptionFromTuple(item.Hash, ok) }(),
-				isTorrent:     isTorrent,
-				inPreverified: ok,
-			})
-			stats := &me.stats.retained
-			if doRemove {
-				stats = &me.stats.removed
-				err = me.removeFunc(path)
-				if err != nil {
-					return fmt.Errorf("removing file %v: %w", path, err)
+					return fmt.Errorf("removing file %v: %w", name, err)
 				}
 			}
 			if isTorrent {
