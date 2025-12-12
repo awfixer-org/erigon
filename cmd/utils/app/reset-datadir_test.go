@@ -10,26 +10,35 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"syscall"
 	"testing"
 
 	g "github.com/anacrolix/generics"
+	"github.com/anacrolix/missinggo/v2/panicif"
 	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/go-quicktest/qt"
 )
 
+func haveDir(name string) fsChecker {
+	return haveEntry(fsEntry{
+		Name: name,
+		Mode: fs.ModeDir,
+	})
+}
+
 func TestResetChaindata(t *testing.T) {
 	t.Run("Normal", func(t *testing.T) {
-		testResetLocalFs(t, []fsEntry{
+		testResetDatadirRoot(t, []fsEntry{
 			{Name: "chaindata/mdbx.dat"},
 			{Name: "chaindata/mdbx.lck"},
-		}, nil, qt.IsNil)
+		}, []fsChecker{haveDir(".")}, qt.IsNil)
 	})
 	t.Run("DanglingSymlink", func(t *testing.T) {
 		startEntries := []fsEntry{
 			{Name: "chaindata", Mode: fs.ModeSymlink, Data: "symlink"},
 		}
-		testResetLocalFs(t, startEntries, haveEntries(slices.Clone(startEntries)...), qt.IsNil)
+		testResetDatadirRoot(t, startEntries, haveEntries(slices.Clone(startEntries)...), qt.IsNotNil)
 	})
 	t.Run("Symlinked", func(t *testing.T) {
 		startEntries := []fsEntry{
@@ -38,23 +47,14 @@ func TestResetChaindata(t *testing.T) {
 			{Name: "symlink/mdbx.dat"},
 			{Name: "symlink/mdbx.lck"},
 		}
-		testResetLocalFs(t, startEntries, haveEntries(slices.Clone(startEntries[:2])...), qt.IsNil)
+		testResetDatadirRoot(t, startEntries, haveEntries(slices.Clone(startEntries[:2])...), qt.IsNil)
 	})
 	t.Run("LinkLoop", func(t *testing.T) {
 		startEntries := []fsEntry{
 			{Name: "chaindata/a", Mode: fs.ModeSymlink, Data: "b"},
 			{Name: "chaindata/b", Mode: fs.ModeSymlink, Data: "a"},
 		}
-		testResetLocalFs(t, startEntries, haveEntries(startEntries...), qt.IsNotNil)
-	})
-	t.Run("CheapDiskExample", func(t *testing.T) {
-		startEntries := []fsEntry{
-			{Name: "chaindata", Mode: fs.ModeSymlink, Data: "fastdisk"},
-			{Name: "snapshots", Mode: fs.ModeDir},
-			{Name: "symlink/mdbx.dat"},
-			{Name: "symlink/mdbx.lck"},
-		}
-		testResetLocalFs(t, startEntries, haveEntries(slices.Clone(startEntries[:2])...), qt.IsNil)
+		testResetDatadirRoot(t, startEntries, haveEntries(startEntries...), qt.IsNotNil)
 	})
 }
 
@@ -69,45 +69,53 @@ func TestResetEscapeRootAbsoluteSymlink(t *testing.T) {
 		{Name: "datadir/snapshots/history", Mode: fs.ModeDir},
 		{Name: "datadir/heimdall/mystuff"},
 	}
-	endEntries := append(
-		slices.Clone(startEntries[:5]),
-		fsEntry{Name: ".", Mode: fs.ModeDir})
 	withOsRoot(t, func(osRoot *os.Root) {
 		makeEntries(t, startEntries, osRoot)
 		rootFS := osRoot.FS()
 		printFs(t, rootFS)
-		r := makeTestingReset(t)
-		r.datadirPath = "datadir"
-		r.fs = rootFS
-		r.removeFunc = osRoot.Remove
+		r := makeTestingReset(t, startEntries, osRoot.Remove, "datadir", osRoot.FS())
 		qt.Assert(t, qt.ErrorMatches(r.run(), pathEscapesFromParent))
-		checkFs(t, rootFS, haveEntries(endEntries...)...)
 	})
 }
+
+func fakeMount(name string) fsEntry {
+	return fsEntry{Name: name, Mode: fs.ModeDir, Remove: func() error {
+		// I hope this works on Windows...
+		return syscall.EBUSY
+	}}
+}
+
 func TestResetCheapDiskExample(t *testing.T) {
-	withOsRoot(t, func(osRoot *os.Root) {
-		absFastDiskLink, err := filepath.Abs(filepath.Join(osRoot.Name(), "fastdisk"))
+	withOsRoot(t, func(testRoot *os.Root) {
+		absFastDiskLink, err := filepath.Abs(filepath.Join(testRoot.Name(), "fastdisk"))
 		qt.Assert(t, qt.IsNil(err))
 		t.Log("absolute fastdisk path:", absFastDiskLink)
 		startEntries := []fsEntry{
 			{Name: "bystander"},
 			{Name: "datadir/chaindata", Mode: fs.ModeSymlink, Data: "../fastdisk"},
 			{Name: "fastdisk", Mode: fs.ModeDir},
+			{Name: "mount", Mode: fs.ModeDir},
 			{Name: "datadir/snapshots", Mode: fs.ModeDir},
 			{Name: "datadir/snapshots/domain", Mode: fs.ModeSymlink, Data: absFastDiskLink},
+			fakeMount("datadir/heimdall/mystuff"),
 			{Name: "datadir/snapshots/history", Mode: fs.ModeDir},
-			{Name: "datadir/heimdall/mystuff"},
 		}
 		endEntries := append(
-			slices.Clone(startEntries[:5]),
+			slices.Clone(startEntries[:7]),
 			fsEntry{Name: ".", Mode: fs.ModeDir})
-		makeEntries(t, startEntries, osRoot)
-		rootFS := osRoot.FS()
+		makeEntries(t, startEntries, testRoot)
+		rootFS := testRoot.FS()
 		printFs(t, rootFS)
-		r := makeTestingReset(t)
-		r.datadirPath = "datadir"
-		r.fs = rootFS
-		r.removeFunc = osRoot.Remove
+		resetRootPath := filepath.Join(testRoot.Name(), "datadir")
+		remove := func(name string) error {
+			local, err := filepath.Localize(name)
+			panicif.Err(err)
+			a := filepath.Join(resetRootPath, local)
+			rel, err := filepath.Rel(testRoot.Name(), a)
+			panicif.Err(err)
+			return testRoot.Remove(rel)
+		}
+		r := makeTestingReset(t, startEntries, remove, "datadir", testRoot.FS())
 		qt.Assert(t, qt.IsNil(r.run()))
 		checkFs(t, rootFS, haveEntries(endEntries...)...)
 	})
@@ -125,10 +133,7 @@ func TestResetSymlinkEscapes(t *testing.T) {
 		qt.Assert(t, qt.IsNil(err))
 		rootFS := osRoot.FS()
 		printFs(t, rootFS)
-		r := makeTestingReset(t)
-		r.datadirPath = "."
-		r.fs = resetJail.FS()
-		r.removeFunc = resetJail.Remove
+		r := makeTestingReset(t, startEntries, resetJail.Remove, ".", resetJail.FS())
 		err = r.run()
 		qt.Check(t, qt.ErrorMatches(err, pathEscapesFromParent))
 		checkFs(t, rootFS, haveEntries(endEntries...)...)
@@ -138,9 +143,11 @@ func TestResetSymlinkEscapes(t *testing.T) {
 var pathEscapesFromParent = regexp.MustCompile("path escapes from parent$")
 
 type fsEntry struct {
-	Name string
-	Data string
-	Mode fs.FileMode
+	Name   string
+	Data   string
+	Mode   fs.FileMode
+	Stat   func() (fs.FileInfo, error)
+	Remove func() error
 }
 
 func (me fsEntry) readData(fsys fs.FS) (string, error) {
@@ -170,20 +177,14 @@ func withOsRoot(t *testing.T, with func(root *os.Root)) {
 	with(osRoot)
 }
 
-func testResetLocalFs(t *testing.T, startEntries []fsEntry, checkers []fsChecker, runChecker func(error) qt.Checker) {
+func testResetDatadirRoot(t *testing.T, startEntries []fsEntry, checkers []fsChecker, runChecker func(error) qt.Checker) {
 	withOsRoot(t, func(osRoot *os.Root) {
 		makeEntries(t, startEntries, osRoot)
-		rootFS := os.DirFS(osRoot.Name())
+		rootFS := osRoot.FS()
 		printFs(t, rootFS)
-		r := makeTestingReset(t)
-		r.fs = rootFS
-		r.removeFunc = osRoot.Remove
+		r := makeTestingReset(t, startEntries, osRoot.Remove, ".", rootFS)
 		qt.Assert(t, runChecker(r.run()))
-		checkFs(t, rootFS, append(
-			checkers,
-			// We're running on a temp dir that always exists. Reset doesn't remove the top-level
-			// datadir.
-			haveEntry(fsEntry{Name: ".", Mode: fs.ModeDir}))...)
+		checkFs(t, rootFS, checkers...)
 	})
 }
 
@@ -290,6 +291,7 @@ func checkFs(t *testing.T, fsRoot fs.FS, checkers ...fsChecker) {
 		".",
 		func(path string, d fs.DirEntry, err error) error {
 			println("checkFs", path, d, err)
+			matched := false
 			for _, c := range checkers {
 				stop, err := c.OnWalkDir(fsCheckerWalkInput{
 					name: path,
@@ -297,15 +299,16 @@ func checkFs(t *testing.T, fsRoot fs.FS, checkers ...fsChecker) {
 					err:  err,
 					fs:   fsRoot,
 				})
-				// Maybe this is t.Errorf is stop is false?
 				if err != nil {
 					return err
 				}
 				if stop {
-					return nil
+					matched = true
 				}
 			}
-			t.Errorf("unexpected path %q", path)
+			if !matched {
+				t.Errorf("unmatched path %q", path)
+			}
 			return nil
 		},
 	)))
@@ -335,14 +338,53 @@ func makeEntries(t *testing.T, entries []fsEntry, root *os.Root) {
 	return
 }
 
-func makeTestingReset(t *testing.T) reset {
-	logger := log.New( /*"test", t.Name()*/ )
-	logger.SetHandler(log.StdoutHandler)
+func makeTestingReset(
+	t *testing.T,
+	entries []fsEntry,
+	// Receives path-style name relative to fsys.
+	remove func(name string) error,
+	// Map fs paths to entries and remove
+	datadirRoot string,
+	// Datadir root
+	fsys fs.FS,
+) reset {
+	fsys, err := fs.Sub(fsys, datadirRoot)
+	qt.Assert(t, qt.IsNil(err))
+	logger := log.New("test", t.Name())
+	logger.SetHandler(log.StderrHandler)
 	return reset{
 		logger:               logger,
 		preverifiedSnapshots: nil,
 		removeUnknown:        true,
 		removeLocal:          true,
-		linkLimit:            3,
+		removeFunc: func(name string) error {
+			name = path.Join(datadirRoot, name)
+			for _, entry := range entries {
+				if entry.Name == name && entry.Remove != nil {
+					return entry.Remove()
+				}
+			}
+			return remove(name)
+		},
+		fs: fsys,
 	}
 }
+
+//func TestAbsSymlinkInsideRoot(t *testing.T) {
+//	d := t.TempDir()
+//	t.Logf("temp dir: %q", d)
+//	root, err := os.OpenRoot(d)
+//	qt.Assert(t, qt.IsNil(err))
+//	err = root.Mkdir("a", dir.DirPerm)
+//	qt.Assert(t, qt.IsNil(err))
+//	err = root.Mkdir("b", dir.DirPerm)
+//	qt.Assert(t, qt.IsNil(err))
+//	absSymlinkName := filepath.Join(d, "a", "c")
+//	err = root.Symlink(filepath.Join(d, "b"), "a/c")
+//	qt.Assert(t, qt.IsNil(err))
+//	fsys := os.DirFS(d)
+//	_, err = fs.ReadDir(fsys, "a/c")
+//	qt.Check(t, qt.IsNil(err))
+//	_, err = root.Open(absSymlinkName)
+//	qt.Assert(t, qt.IsNil(err))
+//}

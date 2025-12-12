@@ -168,18 +168,21 @@ func (reset *reset) run() (err error) {
 	// Remove chaindata last, so that the config is available if there's an error.
 	if reset.removeLocal {
 		for _, extraDir := range []string{
-			dbcfg.HeimdallDB,
+			reset.dirs.
+				dbcfg.HeimdallDB,
 			dbcfg.PolygonBridgeDB,
 		} {
 			// Probably shouldn't log these unless they existed, it would confuse the user for
 			// unrelated chains.
-			err = reset.removeAll(path.Join(reset.datadirPath, extraDir))
+			ra := reset.makeRemoveAll(extraDir)
+			ra.warnNoRoot = false
+			err = ra.do()
 			if err != nil {
 				return fmt.Errorf("removing extra dir %q: %w", extraDir, err)
 			}
 		}
 		logger.Info("Removing chaindata dir", "path", reset.pathForLog(dbcfg.ChainDB))
-		err = reset.removeAll(path.Join(reset.datadirPath, dbcfg.ChainDB))
+		err = reset.makeRemoveAll(dbcfg.ChainDB).do()
 		if err != nil {
 			err = fmt.Errorf("removing chaindata dir: %w", err)
 			return
@@ -198,43 +201,67 @@ func (reset *reset) run() (err error) {
 	return nil
 }
 
+// Removes the contents of directories, and symlinks to *non-directories*. Non-directory symlink
+// targets will be cleaned up as appropriate if the target is found. We also remove anything else.
+// Note that remove means calling the remove field, which makes the real decisions.
 type removeAll struct {
-	logger log.Logger
-	fs     fs.FS
-	remove func(name string, info fs.FileInfo) error
+	logger     log.Logger
+	root       string
+	removeFunc func(name string, info fs.FileInfo) error
+	warnNoRoot bool
 }
 
-// The recursive remove call. We remove the contents of directories, and symlinks to
-// *non-directories*. Non-directory symlink targets will be cleaned up as appropriate if the target
-// is found. We also remove anything else. Note that remove means calling the remove field, which
-// makes the real decisions.
-func (me removeAll) inner(name string, fi fs.FileInfo) error {
-	switch modeType := fi.Mode().Type(); modeType {
-	case fs.ModeDir:
-		entries, err := fs.ReadDir(me.fs, name)
+func (me removeAll) remove(name string, info fs.FileInfo) error {
+	return me.removeFunc(path.Join(me.root, name), info)
+}
+
+// Removes the contents of a directory. Does not remove the directory.
+func (me removeAll) dir(name string) error {
+	entries, err := os.ReadDir(name)
+	if err != nil {
+		return err
+	}
+	for _, de := range entries {
+		info, err := de.Info()
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		fullName := path.Join(name, de.Name())
+		err = me.inner(fullName, info)
 		if err != nil {
 			return err
 		}
-		for _, de := range entries {
-			info, err := de.Info()
-			if err != nil {
-				return err
-			}
-			fullName := path.Join(name, de.Name())
-			err = me.inner(fullName, info)
-			if err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+// Remove name if appropriate.
+func (me removeAll) inner(name string, fi fs.FileInfo) error {
+	switch modeType := fi.Mode().Type(); modeType {
+	case fs.ModeDir:
+		err := me.dir(name)
+		if err != nil {
+			return err
+		}
+		// We don't super care if directories fail to get removed.
+		if err := me.remove(name, fi); err != nil {
+			// Should handle the case where it's a mountpoint.
+			me.logger.Warn("Error removing directory", "name", name, "err", err)
 		}
 		return nil
 	case fs.ModeSymlink:
-		targetInfo, err := fs.Stat(me.fs, name)
+		targetInfo, err := os.Stat(name)
 		if err != nil {
+			// Dangling symlinks are bad because we can't decide if we should remove them because we
+			// want to preserve links to directories.
 			return fmt.Errorf("statting symlink target: %w", err)
 		}
 		if targetInfo.IsDir() {
 			// Remove the contents only
-			return me.inner(name, targetInfo)
+			return me.dir(name)
 		} else {
 			// Remove the link itself
 			return me.remove(name, fi)
@@ -244,27 +271,29 @@ func (me removeAll) inner(name string, fi fs.FileInfo) error {
 	}
 }
 
-func (me removeAll) do(name string) error {
-	info, err := fs.Stat(me.fs, name)
+func (me removeAll) do() error {
+	info, err := os.Lstat(me.root)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			if me.warnNoRoot {
+				me.logger.Warn("Error removing top-level", "root", me.root, "err", err)
+			}
+			return nil
+		}
 		return err
 	}
-	return me.inner(name, info)
+	return me.inner(".", info)
 }
 
-func (reset *reset) removeAll(name string) error {
-	return reset.removeAllFancy(name, func(name string, info fs.FileInfo) error {
-		return reset.removeFunc(name)
-	})
-}
-
-func (reset *reset) removeAllFancy(name string, remove func(name string, info fs.FileInfo) error) error {
-	ra := removeAll{
+func (reset *reset) makeRemoveAll(root string) removeAll {
+	return removeAll{
 		logger: reset.logger,
-		fs:     reset.fs,
-		remove: remove,
+		removeFunc: func(name string, info fs.FileInfo) error {
+			return reset.removeFunc(name)
+		},
+		root:       root,
+		warnNoRoot: true,
 	}
-	return ra.do(name)
 }
 
 // Probably want to render full/real path rather than rooted inside fs.
@@ -321,13 +350,11 @@ type reset struct {
 	logger log.Logger
 	// path is the relative path to the walk root. Called for each file that should be removed.
 	// Error is passed back to the walk function.
-	removeFunc           func(path string) error
-	fs                   fs.FS
-	datadirPath          string
+	removeFunc           func(name string) error
 	preverifiedSnapshots snapcfg.PreverifiedItems
 	removeUnknown        bool
 	removeLocal          bool
-	linkLimit            int
+	dirs                 *datadir.Dirs
 
 	stats struct {
 		removed  resetStats
@@ -343,34 +370,33 @@ type resetItemInfo struct {
 }
 
 func (me *reset) doSnapshots() (err error) {
-	return me.removeAllFancy(
-		path.Join(me.datadirPath, datadir.SnapDir),
-		func(name string, info fs.FileInfo) error {
-			itemName, _ := strings.CutSuffix(name, ".part")
-			itemName, isTorrent := strings.CutSuffix(itemName, ".torrent")
-			item, ok := me.preverifiedSnapshots.Get(itemName)
-			doRemove := me.decideRemove(resetItemInfo{
-				path:          name,
-				hash:          func() g.Option[string] { return g.OptionFromTuple(item.Hash, ok) }(),
-				isTorrent:     isTorrent,
-				inPreverified: ok,
-			})
-			stats := &me.stats.retained
-			if doRemove {
-				stats = &me.stats.removed
-				err = me.removeFunc(name)
-				if err != nil {
-					return fmt.Errorf("removing file %v: %w", name, err)
-				}
+	ra := me.makeRemoveAll(me.dirs.Snap)
+	ra.removeFunc = func(name string, info fs.FileInfo) error {
+		itemName, _ := strings.CutSuffix(name, ".part")
+		itemName, isTorrent := strings.CutSuffix(itemName, ".torrent")
+		item, ok := me.preverifiedSnapshots.Get(itemName)
+		doRemove := me.decideRemove(resetItemInfo{
+			path:          name,
+			hash:          func() g.Option[string] { return g.OptionFromTuple(item.Hash, ok) }(),
+			isTorrent:     isTorrent,
+			inPreverified: ok,
+		})
+		stats := &me.stats.retained
+		if doRemove {
+			stats = &me.stats.removed
+			err = me.removeFunc(name)
+			if err != nil {
+				return fmt.Errorf("removing file %v: %w", name, err)
 			}
-			if isTorrent {
-				stats.torrentFiles++
-			} else {
-				stats.dataFiles++
-			}
-			return nil
-		},
-	)
+		}
+		if isTorrent {
+			stats.torrentFiles++
+		} else {
+			stats.dataFiles++
+		}
+		return nil
+	}
+	return ra.do()
 }
 
 // Decides whether to remove a file, and logs the reasoning.
