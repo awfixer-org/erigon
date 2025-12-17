@@ -14,7 +14,6 @@ import (
 	"testing"
 
 	g "github.com/anacrolix/generics"
-	"github.com/anacrolix/missinggo/v2/panicif"
 	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/go-quicktest/qt"
@@ -22,7 +21,7 @@ import (
 
 func haveDir(name string) fsChecker {
 	return haveEntry(fsEntry{
-		Name: name,
+		Name: slashName(name),
 		Mode: fs.ModeDir,
 	})
 }
@@ -58,28 +57,8 @@ func TestResetChaindata(t *testing.T) {
 	})
 }
 
-func TestResetEscapeRootAbsoluteSymlink(t *testing.T) {
-	const fastDiskName = "fastdisk"
-	startEntries := []fsEntry{
-		{Name: "bystander"},
-		{Name: "datadir/chaindata", Mode: fs.ModeSymlink, Data: path.Join("..", fastDiskName)},
-		{Name: fastDiskName, Mode: fs.ModeDir},
-		{Name: "datadir/snapshots", Mode: fs.ModeDir},
-		{Name: "datadir/snapshots/domain", Mode: fs.ModeSymlink, Data: "/fastdisk"},
-		{Name: "datadir/snapshots/history", Mode: fs.ModeDir},
-		{Name: "datadir/heimdall/mystuff"},
-	}
-	withOsRoot(t, func(osRoot *os.Root) {
-		makeEntries(t, startEntries, osRoot)
-		rootFS := osRoot.FS()
-		printFs(t, rootFS)
-		r := makeTestingReset(t, startEntries, osRoot.Remove, "datadir", osRoot.FS())
-		qt.Assert(t, qt.ErrorMatches(r.run(), pathEscapesFromParent))
-	})
-}
-
 func fakeMount(name string) fsEntry {
-	return fsEntry{Name: name, Mode: fs.ModeDir, Remove: func() error {
+	return fsEntry{Name: slashName(name), Mode: fs.ModeDir, Remove: func() error {
 		// I hope this works on Windows...
 		return syscall.EBUSY
 	}}
@@ -89,7 +68,7 @@ func TestResetCheapDiskExample(t *testing.T) {
 	withOsRoot(t, func(testRoot *os.Root) {
 		absFastDiskLink, err := filepath.Abs(filepath.Join(testRoot.Name(), "fastdisk"))
 		qt.Assert(t, qt.IsNil(err))
-		t.Log("absolute fastdisk path:", absFastDiskLink)
+		t.Log("absolute fastdisk name:", absFastDiskLink)
 		startEntries := []fsEntry{
 			{Name: "bystander"},
 			{Name: "datadir/chaindata", Mode: fs.ModeSymlink, Data: "../fastdisk"},
@@ -106,25 +85,36 @@ func TestResetCheapDiskExample(t *testing.T) {
 		makeEntries(t, startEntries, testRoot)
 		rootFS := testRoot.FS()
 		printFs(t, rootFS)
-		resetRootPath := filepath.Join(testRoot.Name(), "datadir")
-		remove := func(name string) error {
-			local, err := filepath.Localize(name)
-			panicif.Err(err)
-			a := filepath.Join(resetRootPath, local)
-			rel, err := filepath.Rel(testRoot.Name(), a)
-			panicif.Err(err)
-			return testRoot.Remove(rel)
-		}
-		r := makeTestingReset(t, startEntries, remove, "datadir", testRoot.FS())
+		r := makeTestingReset(t, startEntries, testRoot, "datadir")
 		qt.Assert(t, qt.IsNil(r.run()))
 		checkFs(t, rootFS, haveEntries(endEntries...)...)
 	})
 }
 
-func TestResetSymlinkEscapes(t *testing.T) {
+func TestResetSymlinkToExternalFile(t *testing.T) {
 	startEntries := []fsEntry{
-		{Name: "jail/snapshots/badlink", Mode: fs.ModeSymlink, Data: "../../escape"},
 		{Name: "escape"},
+		{Name: "jail/snapshots/badlink", Mode: fs.ModeSymlink, Data: "../../escape"},
+	}
+	withOsRoot(t, func(osRoot *os.Root) {
+		makeEntries(t, startEntries, osRoot)
+		resetJail, err := osRoot.OpenRoot("jail")
+		qt.Assert(t, qt.IsNil(err))
+		rootFS := osRoot.FS()
+		printFs(t, rootFS)
+		r := makeTestingReset(t, startEntries, resetJail, ".")
+		err = r.run()
+		qt.Check(t, qt.IsNil(err))
+		endEntries := haveEntries(startEntries[0])
+		endEntries = append(endEntries, haveDir("jail"))
+		checkFs(t, rootFS, endEntries...)
+	})
+}
+
+func TestResetSymlinkToExternalDirWithContents(t *testing.T) {
+	startEntries := []fsEntry{
+		{Name: "jail/snapshots/link", Mode: fs.ModeSymlink, Data: "../../escape"},
+		{Name: "escape/halp"},
 	}
 	endEntries := slices.Clone(startEntries)
 	withOsRoot(t, func(osRoot *os.Root) {
@@ -133,7 +123,7 @@ func TestResetSymlinkEscapes(t *testing.T) {
 		qt.Assert(t, qt.IsNil(err))
 		rootFS := osRoot.FS()
 		printFs(t, rootFS)
-		r := makeTestingReset(t, startEntries, resetJail.Remove, ".", resetJail.FS())
+		r := makeTestingReset(t, startEntries, resetJail, ".")
 		err = r.run()
 		qt.Check(t, qt.ErrorMatches(err, pathEscapesFromParent))
 		checkFs(t, rootFS, haveEntries(endEntries...)...)
@@ -143,7 +133,7 @@ func TestResetSymlinkEscapes(t *testing.T) {
 var pathEscapesFromParent = regexp.MustCompile("path escapes from parent$")
 
 type fsEntry struct {
-	Name   string
+	Name   slashName
 	Data   string
 	Mode   fs.FileMode
 	Stat   func() (fs.FileInfo, error)
@@ -153,9 +143,9 @@ type fsEntry struct {
 func (me fsEntry) readData(fsys fs.FS) (string, error) {
 	switch mt := me.Mode.Type(); mt {
 	case fs.ModeSymlink:
-		return fs.ReadLink(fsys, me.Name)
+		return fs.ReadLink(fsys, string(me.Name))
 	case 0:
-		b, err := fs.ReadFile(fsys, me.Name)
+		b, err := fs.ReadFile(fsys, string(me.Name))
 		return string(b), err
 	case fs.ModeDir:
 		return "", nil
@@ -182,16 +172,16 @@ func testResetDatadirRoot(t *testing.T, startEntries []fsEntry, checkers []fsChe
 		makeEntries(t, startEntries, osRoot)
 		rootFS := osRoot.FS()
 		printFs(t, rootFS)
-		r := makeTestingReset(t, startEntries, osRoot.Remove, ".", rootFS)
+		r := makeTestingReset(t, startEntries, osRoot, ".")
 		qt.Assert(t, runChecker(r.run()))
 		checkFs(t, rootFS, checkers...)
 	})
 }
 
-func parentNames(name string) iter.Seq[string] {
-	return func(yield func(string) bool) {
+func parentNames(name slashName) iter.Seq[slashName] {
+	return func(yield func(name2 slashName) bool) {
 		for {
-			name = path.Dir(name)
+			name = slashName(path.Dir(string(name)))
 			if name == "" {
 				return
 			}
@@ -206,7 +196,7 @@ func parentNames(name string) iter.Seq[string] {
 }
 
 func haveEntries(entries ...fsEntry) (ret []fsChecker) {
-	byName := make(map[string]fsChecker)
+	byName := make(map[slashName]fsChecker)
 	for _, e := range entries {
 		g.MapMustAssignNew(byName, e.Name, haveEntry(e))
 	}
@@ -251,7 +241,7 @@ func haveEntry(entry fsEntry) fsChecker {
 
 func printFs(t *testing.T, rootFS fs.FS) {
 	qt.Assert(t, qt.IsNil(fs.WalkDir(rootFS, ".", func(path string, d fs.DirEntry, err error) error {
-		t.Logf("path: %q, mode: %v, err: %v\n", path, d.Type(), err)
+		t.Logf("name: %q, mode: %v, err: %v\n", path, d.Type(), err)
 		return nil
 	})))
 }
@@ -279,7 +269,7 @@ type fsChecker interface {
 }
 
 type fsCheckerWalkInput struct {
-	name string
+	name slashName
 	d    fs.DirEntry
 	err  error
 	fs   fs.FS
@@ -294,7 +284,7 @@ func checkFs(t *testing.T, fsRoot fs.FS, checkers ...fsChecker) {
 			matched := false
 			for _, c := range checkers {
 				stop, err := c.OnWalkDir(fsCheckerWalkInput{
-					name: path,
+					name: slashName(path),
 					d:    d,
 					err:  err,
 					fs:   fsRoot,
@@ -307,7 +297,7 @@ func checkFs(t *testing.T, fsRoot fs.FS, checkers ...fsChecker) {
 				}
 			}
 			if !matched {
-				t.Errorf("unmatched path %q", path)
+				t.Errorf("unmatched name %q", path)
 			}
 			return nil
 		},
@@ -322,7 +312,7 @@ func makeEntries(t *testing.T, entries []fsEntry, root *os.Root) {
 		qt.Assert(t, qt.IsNil(err))
 	}
 	for _, entry := range entries {
-		localName, err := filepath.Localize(entry.Name)
+		localName, err := filepath.Localize(string(entry.Name))
 		qt.Assert(t, qt.IsNil(err), qt.Commentf("localizing entry name %q", entry.Name))
 		root.MkdirAll(filepath.Dir(localName), dir.DirPerm)
 		if entry.Mode&fs.ModeSymlink != 0 {
@@ -341,32 +331,28 @@ func makeEntries(t *testing.T, entries []fsEntry, root *os.Root) {
 func makeTestingReset(
 	t *testing.T,
 	entries []fsEntry,
-	// Receives path-style name relative to fsys.
-	remove func(name string) error,
-	// Map fs paths to entries and remove
-	datadirRoot string,
-	// Datadir root
-	fsys fs.FS,
+	osRoot *os.Root,
+	datadir slashName,
 ) reset {
-	fsys, err := fs.Sub(fsys, datadirRoot)
-	qt.Assert(t, qt.IsNil(err))
 	logger := log.New("test", t.Name())
 	logger.SetHandler(log.StderrHandler)
+	osRootPath := osFilePath(osRoot.Name())
+	datadirOs := osFilePath(osRoot.Name()).Join(datadir.FromSlash())
 	return reset{
+		datadir:              datadirOs,
 		logger:               logger,
 		preverifiedSnapshots: nil,
 		removeUnknown:        true,
 		removeLocal:          true,
-		removeFunc: func(name string) error {
-			name = path.Join(datadirRoot, name)
+		removeFunc: func(osFilePath osFilePath) error {
+			slashName := osFilePath.MustLocalRelSlash(osRootPath)
 			for _, entry := range entries {
-				if entry.Name == name && entry.Remove != nil {
+				if entry.Name == slashName && entry.Remove != nil {
 					return entry.Remove()
 				}
 			}
-			return remove(name)
+			return osRoot.Remove(string(osFilePath.MustRel(osRootPath)))
 		},
-		fs: fsys,
 	}
 }
 
