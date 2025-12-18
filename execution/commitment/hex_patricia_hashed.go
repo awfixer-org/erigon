@@ -55,6 +55,22 @@ type keccakState interface {
 	Read([]byte) (int, error)
 }
 
+// cellHasher contains resources needed for parallel cell hash computation
+type cellHasher struct {
+	keccak    keccakState
+	auxBuffer *bytes.Buffer
+	hashBuf   [128]byte
+	accValBuf rlp.RlpEncodedBytes
+}
+
+func newCellHasher() *cellHasher {
+	return &cellHasher{
+		keccak:    sha3.NewLegacyKeccak256().(keccakState),
+		auxBuffer: bytes.NewBuffer(make([]byte, 0, 128)),
+		accValBuf: make(rlp.RlpEncodedBytes, 128),
+	}
+}
+
 // HexPatriciaHashed implements commitment based on patricia merkle tree with radix 16,
 // with keys pre-hashed by keccak256
 type HexPatriciaHashed struct {
@@ -713,6 +729,273 @@ func (hph *HexPatriciaHashed) extensionHash(key []byte, hash []byte) (common.Has
 		return hashBuf, err
 	}
 	return hashBuf, nil
+}
+
+// Parallel-safe versions of hash functions that use provided cellHasher instead of hph.keccak
+
+func (hph *HexPatriciaHashed) completeLeafHashWith(h *cellHasher, buf []byte, compactLen int, key []byte, compact0 byte, ni int, val rlp.RlpSerializable, singleton bool) ([]byte, error) {
+	var kp, kl int
+	var keyPrefix [1]byte
+	if compactLen > 1 {
+		keyPrefix[0] = 0x80 + byte(compactLen)
+		kp = 1
+		kl = compactLen
+	} else {
+		kl = 1
+	}
+
+	totalLen := kp + kl + val.DoubleRLPLen()
+	var lenPrefix [4]byte
+	pl := rlp.GenerateStructLen(lenPrefix[:], totalLen)
+	canEmbed := !singleton && totalLen+pl < length.Hash
+	var writer io.Writer
+	if canEmbed {
+		h.auxBuffer.Reset()
+		writer = h.auxBuffer
+	} else {
+		h.keccak.Reset()
+		writer = h.keccak
+	}
+	if _, err := writer.Write(lenPrefix[:pl]); err != nil {
+		return nil, err
+	}
+	if _, err := writer.Write(keyPrefix[:kp]); err != nil {
+		return nil, err
+	}
+	b := [1]byte{compact0}
+	if _, err := writer.Write(b[:]); err != nil {
+		return nil, err
+	}
+	for i := 1; i < compactLen; i++ {
+		b[0] = key[ni]*16 + key[ni+1]
+		if _, err := writer.Write(b[:]); err != nil {
+			return nil, err
+		}
+		ni += 2
+	}
+	var prefixBuf [8]byte
+	if err := val.ToDoubleRLP(writer, prefixBuf[:]); err != nil {
+		return nil, err
+	}
+	if canEmbed {
+		buf = h.auxBuffer.Bytes()
+	} else {
+		var hashBuf [33]byte
+		hashBuf[0] = 0x80 + length.Hash
+		if _, err := h.keccak.Read(hashBuf[1:]); err != nil {
+			return nil, err
+		}
+		buf = append(buf, hashBuf[:]...)
+	}
+	return buf, nil
+}
+
+func (hph *HexPatriciaHashed) leafHashWithKeyValWith(h *cellHasher, buf, key []byte, val rlp.RlpSerializableBytes, singleton bool) ([]byte, error) {
+	var compactLen int
+	var ni int
+	var compact0 byte
+	compactLen = (len(key)-1)/2 + 1
+	if len(key)&1 == 0 {
+		compact0 = 0x30 + key[0]
+		ni = 1
+	} else {
+		compact0 = 0x20
+	}
+	return hph.completeLeafHashWith(h, buf, compactLen, key, compact0, ni, val, singleton)
+}
+
+func (hph *HexPatriciaHashed) accountLeafHashWithKeyWith(h *cellHasher, buf, key []byte, val rlp.RlpSerializable) ([]byte, error) {
+	var compactLen int
+	var ni int
+	var compact0 byte
+	if hasTerm(key) {
+		compactLen = (len(key)-1)/2 + 1
+		if len(key)&1 == 0 {
+			compact0 = 48 + key[0]
+			ni = 1
+		} else {
+			compact0 = 32
+		}
+	} else {
+		compactLen = len(key)/2 + 1
+		if len(key)&1 == 1 {
+			compact0 = terminatorHexByte + key[0]
+			ni = 1
+		}
+	}
+	return hph.completeLeafHashWith(h, buf, compactLen, key, compact0, ni, val, true)
+}
+
+func (hph *HexPatriciaHashed) extensionHashWith(h *cellHasher, key []byte, hash []byte) (common.Hash, error) {
+	var hashBuf common.Hash
+	var kp, kl int
+	var compactLen int
+	var ni int
+	var compact0 byte
+	if hasTerm(key) {
+		compactLen = (len(key)-1)/2 + 1
+		if len(key)&1 == 0 {
+			compact0 = 0x30 + key[0]
+			ni = 1
+		} else {
+			compact0 = 0x20
+		}
+	} else {
+		compactLen = len(key)/2 + 1
+		if len(key)&1 == 1 {
+			compact0 = 0x10 + key[0]
+			ni = 1
+		}
+	}
+	var keyPrefix [1]byte
+	if compactLen > 1 {
+		keyPrefix[0] = 0x80 + byte(compactLen)
+		kp = 1
+		kl = compactLen
+	} else {
+		kl = 1
+	}
+	totalLen := kp + kl + 33
+	var lenPrefix [4]byte
+	pt := rlp.GenerateStructLen(lenPrefix[:], totalLen)
+	h.keccak.Reset()
+	if _, err := h.keccak.Write(lenPrefix[:pt]); err != nil {
+		return hashBuf, err
+	}
+	if _, err := h.keccak.Write(keyPrefix[:kp]); err != nil {
+		return hashBuf, err
+	}
+	var b [1]byte
+	b[0] = compact0
+	if _, err := h.keccak.Write(b[:]); err != nil {
+		return hashBuf, err
+	}
+	for i := 1; i < compactLen; i++ {
+		b[0] = key[ni]*16 + key[ni+1]
+		if _, err := h.keccak.Write(b[:]); err != nil {
+			return hashBuf, err
+		}
+		ni += 2
+	}
+	b[0] = 0x80 + length.Hash
+	if _, err := h.keccak.Write(b[:]); err != nil {
+		return hashBuf, err
+	}
+	if _, err := h.keccak.Write(hash); err != nil {
+		return hashBuf, err
+	}
+	if _, err := h.keccak.Read(hashBuf[:]); err != nil {
+		return hashBuf, err
+	}
+	return hashBuf, nil
+}
+
+// computeCellHashWith computes cell hash using provided hasher (parallel-safe)
+func (hph *HexPatriciaHashed) computeCellHashWith(h *cellHasher, cell *cell, depth int16, buf []byte) ([]byte, error) {
+	var err error
+	var storageRootHash common.Hash
+	var storageRootHashIsSet bool
+
+	if cell.storageAddrLen > 0 {
+		var hashedKeyOffset int16
+		if depth >= 64 {
+			hashedKeyOffset = depth - 64
+		}
+		singleton := depth <= 64
+		koffset := hph.accountKeyLen
+		if depth == 0 && cell.accountAddrLen == 0 {
+			koffset = 0
+		}
+		if err = cell.hashStorageKey(h.keccak, koffset, 0, hashedKeyOffset); err != nil {
+			return nil, err
+		}
+		cell.hashedExtension[64-hashedKeyOffset] = terminatorHexByte
+
+		if cell.stateHashLen > 0 {
+			h.keccak.Reset()
+			if !singleton {
+				return append(append(buf[:0], byte(160)), cell.stateHash[:cell.stateHashLen]...), nil
+			}
+			storageRootHashIsSet = true
+			storageRootHash = *(*common.Hash)(cell.stateHash[:cell.stateHashLen])
+		} else {
+			if !cell.loaded.storage() {
+				return nil, fmt.Errorf("storage %x was not loaded for parallel hash", cell.storageAddr[:cell.storageAddrLen])
+			}
+
+			leafHash, err := hph.leafHashWithKeyValWith(h, buf, cell.hashedExtension[:64-hashedKeyOffset+1], cell.Storage[:cell.StorageLen], singleton)
+			if err != nil {
+				return nil, err
+			}
+			if !singleton {
+				copy(cell.stateHash[:], leafHash[1:])
+				cell.stateHashLen = int16(len(leafHash) - 1)
+				return leafHash, nil
+			}
+			storageRootHash = *(*common.Hash)(leafHash[1:])
+			storageRootHashIsSet = true
+			cell.stateHashLen = 0
+		}
+	}
+
+	if cell.accountAddrLen > 0 {
+		if err := cell.hashAccKey(h.keccak, depth); err != nil {
+			return nil, err
+		}
+		cell.hashedExtension[64-depth] = terminatorHexByte
+		if !storageRootHashIsSet {
+			if cell.extLen > 0 {
+				if cell.hashLen == 0 {
+					return nil, errors.New("computeCellHashWith extension without hash")
+				}
+				if storageRootHash, err = hph.extensionHashWith(h, cell.extension[:cell.extLen], cell.hash[:cell.hashLen]); err != nil {
+					return nil, err
+				}
+				cell.stateHashLen = 0
+			} else if cell.hashLen > 0 {
+				storageRootHash = cell.hash
+			} else {
+				storageRootHash = empty.RootHash
+			}
+		}
+		if !cell.loaded.account() {
+			if cell.stateHashLen > 0 {
+				h.keccak.Reset()
+				return append(append(buf[:0], byte(160)), cell.stateHash[:cell.stateHashLen]...), nil
+			}
+			return nil, fmt.Errorf("account %x was not loaded for parallel hash", cell.accountAddr[:cell.accountAddrLen])
+		}
+
+		valLen := cell.accountForHashing(h.accValBuf, storageRootHash)
+		buf, err = hph.accountLeafHashWithKeyWith(h, buf, cell.hashedExtension[:65-depth], h.accValBuf[:valLen])
+		if err != nil {
+			return nil, err
+		}
+		copy(cell.stateHash[:], buf[1:])
+		cell.stateHashLen = int16(len(buf)) - 1
+		return buf, nil
+	}
+
+	buf = append(buf, 0x80+32)
+	if cell.extLen > 0 {
+		if cell.hashLen > 0 {
+			if storageRootHash, err = hph.extensionHashWith(h, cell.extension[:cell.extLen], cell.hash[:cell.hashLen]); err != nil {
+				return nil, err
+			}
+			buf = append(buf, storageRootHash[:]...)
+		} else {
+			return nil, errors.New("computeCellHashWith extension without hash")
+		}
+	} else if cell.hashLen > 0 {
+		buf = append(buf, cell.hash[:cell.hashLen]...)
+	} else if storageRootHashIsSet {
+		buf = append(buf, storageRootHash[:]...)
+		copy(cell.hash[:], storageRootHash[:])
+		cell.hashLen = int16(len(storageRootHash))
+	} else {
+		buf = append(buf, emptyRootHashBytes...)
+	}
+	return buf, nil
 }
 
 func (hph *HexPatriciaHashed) computeCellHashLen(cell *cell, depth int16) int16 {
@@ -1771,6 +2054,109 @@ func (hph *HexPatriciaHashed) createCellGetter(b []byte, updateKey []byte, row i
 	}
 }
 
+// batchComputeCellHashes computes cell hashes in parallel for all cells in afterMap
+func (hph *HexPatriciaHashed) batchComputeCellHashes(row int, depth int16, afterMap uint16, numWorkers int) (map[int][]byte, error) {
+	// Collect cells that need hashing
+	type cellWork struct {
+		nibble int
+		cell   *cell
+	}
+	var cellsToHash []cellWork
+	for bitset := afterMap; bitset != 0; {
+		bit := bitset & -bitset
+		nibble := bits.TrailingZeros16(bit)
+		cellsToHash = append(cellsToHash, cellWork{nibble, &hph.grid[row][nibble]})
+		bitset ^= bit
+	}
+
+	if len(cellsToHash) == 0 {
+		return nil, nil
+	}
+
+	// For small number of cells, don't bother with parallelism
+	if len(cellsToHash) <= 2 || numWorkers <= 1 {
+		result := make(map[int][]byte, len(cellsToHash))
+		for _, work := range cellsToHash {
+			cellHash, err := hph.computeCellHash(work.cell, depth, hph.hashAuxBuffer[:0])
+			if err != nil {
+				return nil, err
+			}
+			result[work.nibble] = append([]byte(nil), cellHash...) // copy
+		}
+		return result, nil
+	}
+
+	// Parallel computation
+	type cellResult struct {
+		nibble int
+		hash   []byte
+		err    error
+	}
+	results := make([]cellResult, len(cellsToHash))
+
+	g, _ := errgroup.WithContext(context.Background())
+	g.SetLimit(numWorkers)
+
+	for i, work := range cellsToHash {
+		i, work := i, work // capture
+		g.Go(func() error {
+			h := newCellHasher()
+			cellHash, err := hph.computeCellHashWith(h, work.cell, depth, h.hashBuf[:0])
+			if err != nil {
+				results[i] = cellResult{work.nibble, nil, err}
+				return err
+			}
+			results[i] = cellResult{work.nibble, append([]byte(nil), cellHash...), nil}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Build result map
+	hashByNibble := make(map[int][]byte, len(results))
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		hashByNibble[r.nibble] = r.hash
+	}
+	return hashByNibble, nil
+}
+
+// createCellGetterWithPrecomputed creates a cell getter that uses pre-computed hashes
+func (hph *HexPatriciaHashed) createCellGetterWithPrecomputed(b []byte, updateKey []byte, row int, depth int16, precomputedHashes map[int][]byte) func(nibble int, skip bool) (*cell, error) {
+	return func(nibble int, skip bool) (*cell, error) {
+		if skip {
+			if _, err := hph.keccak2.Write(b); err != nil {
+				return nil, fmt.Errorf("failed to write empty nibble to hash: %w", err)
+			}
+			if hph.trace {
+				fmt.Printf("  %x: empty(%d, %x, depth=%d)\n", nibble, row, nibble, depth)
+			}
+			return nil, nil
+		}
+		cell := &hph.grid[row][nibble]
+
+		cellHash, ok := precomputedHashes[nibble]
+		if !ok {
+			return nil, fmt.Errorf("missing precomputed hash for nibble %x", nibble)
+		}
+
+		if hph.trace {
+			fmt.Printf("  %x: precomputedCellHash(%d, %x, depth=%d)=[%x]\n", nibble, row, nibble, depth, cellHash)
+		}
+
+		if _, err := hph.keccak2.Write(cellHash); err != nil {
+			return nil, err
+		}
+
+		return cell, nil
+	}
+}
+
 const terminatorHexByte = 16 // max nibble value +1. Defines end of nibble line in the trie or splits address and storage space in trie.
 
 // updateKind is a type of update that is being applied to the trie structure.
@@ -1991,8 +2377,14 @@ func (hph *HexPatriciaHashed) fold() (err error) {
 			return err
 		}
 
+		// Batch compute cell hashes in parallel
+		precomputedHashes, err := hph.batchComputeCellHashes(row, depth, hph.afterMap[row], 6)
+		if err != nil {
+			return fmt.Errorf("batch compute cell hashes: %w", err)
+		}
+
 		b := [...]byte{0x80}
-		cellGetter := hph.createCellGetter(b[:], updateKey, row, depth)
+		cellGetter := hph.createCellGetterWithPrecomputed(b[:], updateKey, row, depth, precomputedHashes)
 		lastNibble, err := hph.branchEncoder.CollectUpdate(hph.ctx, updateKey, bitmap, hph.touchMap[row], hph.afterMap[row], cellGetter)
 		if err != nil {
 			return fmt.Errorf("failed to encode branch update: %w", err)
